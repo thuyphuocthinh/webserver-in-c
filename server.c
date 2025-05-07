@@ -52,62 +52,126 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-void httpWorker(int *sockfd) { // sockfd contains all the information
-  int newsockfd = *sockfd;     // create a local variable for sockfd
-  char buffer[256];            // we will read the data in this buffer
-  char *token;        // local variable to split the request to get the filename
-  bzero(buffer, 256); // intialize the buffer data to zero
-  char fileName[50];
-  char homedir[50];
+void httpWorker(int *sockfd) {
+  int newsockfd = *sockfd;
+  char buffer[8192]; // buffer lớn để chứa header + body (nếu nhỏ)
+  char fileName[256];
+  char homedir[256];
+  char method[8];
   char *type;
-  strcpy(homedir, CONTENTDIR); // directory where files are stored.
-  char *respHeader;            // response header
-  // start reading the message from incoming conenction
-  if (read(newsockfd, buffer, 255) < 0)
-    error("ERROR reading from socket");
-  // get the requested file part of the request
-  token = strtok(buffer, " "); // split string into token seperated by " "
-  token = strtok(NULL,
-                 " "); // in this go we read the file name that needs to be sent
+  char *respHeader;
+
+  strcpy(homedir, CONTENTDIR);
+  int total_read = 0, n;
+
+  // Đọc đến khi thấy \r\n\r\n (kết thúc header)
+  while ((n = read(newsockfd, buffer + total_read, sizeof(buffer) - total_read - 1)) > 0) {
+    total_read += n;
+    buffer[total_read] = '\0';
+    if (strstr(buffer, "\r\n\r\n")) break;
+  }
+
+  if (total_read <= 0) {
+    close(newsockfd);
+    return;
+  }
+
+  // In ra header
+  printf("Buffer (header + có thể 1 phần body):\n%.*s\n", total_read, buffer);
+
+  // Giữ lại buffer ban đầu để sử dụng sau này
+  char headerCopy[8192];
+  strcpy(headerCopy, buffer);
+
+  // Parse method và file name
+  char *token = strtok(buffer, " ");
+  if (!token) return;
+  strcpy(method, token);
+
+  token = strtok(NULL, " ");
+  if (!token) return;
   strcpy(fileName, token);
 
-  // get the complete filename
-  if (strcmp(fileName, "/") ==
-      0) // if filename is not provided then we will send index.html
-    strcpy(fileName, strcat(homedir, "/index.html"));
-  else
-    strcpy(fileName, strcat(homedir, fileName));
-  type = fType(fileName); // get file type
-  // open file and ready to send
-  FILE *fp;
-  int file_exist = 1;
-  fp = fopen(fileName, "r");
-  if (fp == NULL)
-    file_exist = 0;
-  respHeader = responseHeader(file_exist, type);
-  if ((send(newsockfd, respHeader, strlen(respHeader), 0) == -1) ||
-      (send(newsockfd, "\r\n", strlen("\r\n"), 0) == -1))
-    perror("Failed to send bytes to client");
+  printf("Method: %s\n", method);
+  printf("File name: %s\n", fileName);
 
-  free(respHeader); // free the allocated memory (note: the memory is allocated
-                    // in responseheader function)
+  if (strcmp(method, "GET") == 0) {
+    if (strcmp(fileName, "/") == 0)
+      strcpy(fileName, strcat(homedir, "/index.html"));
+    else
+      strcpy(fileName, strcat(homedir, fileName));
 
-  if (file_exist) {
-    char filechar[1];
-    while ((filechar[0] = fgetc(fp)) != EOF) {
-      if (send(newsockfd, filechar, sizeof(char), 0) == -1)
-        perror("Failed to send bytes to client");
+    type = fType(fileName);
+    FILE *fp = fopen(fileName, "r");
+    int file_exist = fp != NULL;
+
+    respHeader = responseHeader(file_exist, type);
+    send(newsockfd, respHeader, strlen(respHeader), 0);
+    send(newsockfd, "\r\n", 2, 0);
+    free(respHeader);
+
+    if (file_exist) {
+      char filechar[1];
+      while ((filechar[0] = fgetc(fp)) != EOF)
+        send(newsockfd, filechar, 1, 0);
+      fclose(fp);
+    } else {
+      send(newsockfd, "<html><head><title>404</title></head><body>Not Found</body></html>", 71, 0);
     }
-  } else {
-    if (send(newsockfd,
-             "<html> <HEAD><TITLE>404 Not Found</TITLE></HEAD><BODY>Not "
-             "Found</BODY></html> \r\n",
-             100, 0) == -1)
-      perror("Failed to send bytes to client");
+  }
+
+  else if (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0) {
+    strcpy(fileName, strcat(homedir, fileName));
+    FILE *fp;
+
+    if (strcmp(method, "POST") == 0)
+      fp = fopen(fileName, "a");
+    else
+      fp = fopen(fileName, "w");
+
+    if (fp == NULL) {
+      respHeader = responseHeader(0, "text/plain");
+      send(newsockfd, respHeader, strlen(respHeader), 0);
+      send(newsockfd, "\r\n", 2, 0);
+      free(respHeader);
+    } else {
+      // Tìm Content-Length
+      int content_length = 0;
+      char *cl_ptr = strcasestr(headerCopy, "Content-Length:");
+      if (cl_ptr) {
+        sscanf(cl_ptr, "Content-Length: %d", &content_length);
+        printf("Content-Length: %d\n", content_length);
+      } else {
+        printf("Không tìm thấy Content-Length\n");
+      }
+
+      // Tìm phần body bắt đầu sau \r\n\r\n
+      char *body = strstr(headerCopy, "\r\n\r\n");
+      if (body != NULL) {
+        // Bỏ qua "\r\n\r\n" để trỏ vào phần body thực sự
+        body += 4;
+        printf("Body: %s\n", body);
+        int body_len = strlen(body);
+
+        // Ghi phần body vào file
+        fwrite("\n", 1, 1, fp);
+        fwrite(body, 1, body_len, fp);
+      } else {
+        printf("Không tìm thấy phần body sau header.\n");
+      }
+
+      fclose(fp);
+      respHeader = responseHeader(1, "text/plain");
+      send(newsockfd, respHeader, strlen(respHeader), 0);
+      send(newsockfd, "\r\n", 2, 0);
+      send(newsockfd, "Success\n", 8, 0);
+      free(respHeader);
+    }
   }
 
   close(newsockfd);
 }
+
 
 // function below find the file type of the file requested
 char *fType(char *fileName) {
